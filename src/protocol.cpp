@@ -28,6 +28,11 @@
 #include <netpacket/packet.h>
 #endif
 #ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/network/IOEthernetController.h>
+#include <IOKit/network/IOEthernetInterface.h>
+#include <IOKit/network/IONetworkInterface.h>
 #include <net/if_dl.h>
 #endif
 #define SOCKET int
@@ -294,6 +299,54 @@ static std::vector<uint8_t> readLinuxEth0MacAddress() {
     return result;
 }
 
+static std::vector<uint8_t> readMacPrimaryMacAddress() {
+    std::vector<uint8_t> result;
+#ifdef __APPLE__
+    mach_port_t master_port = MACH_PORT_NULL;
+    if (IOMasterPort(MACH_PORT_NULL, &master_port) != KERN_SUCCESS) return result;
+
+    CFMutableDictionaryRef match = IOServiceMatching(kIOEthernetInterfaceClass);
+    if (!match) return result;
+
+    CFMutableDictionaryRef property_match = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    if (!property_match) {
+        CFRelease(match);
+        return result;
+    }
+
+    CFDictionarySetValue(property_match, CFSTR(kIOPrimaryInterface), kCFBooleanTrue);
+    CFDictionarySetValue(match, CFSTR(kIOPropertyMatchKey), property_match);
+    CFRelease(property_match);
+
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(master_port, match, &iterator) != KERN_SUCCESS) return result;
+
+    io_object_t interface = IO_OBJECT_NULL;
+    while ((interface = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        io_object_t parent = IO_OBJECT_NULL;
+        if (IORegistryEntryGetParentEntry(interface, kIOServicePlane, &parent) == KERN_SUCCESS) {
+            CFTypeRef mac = IORegistryEntryCreateCFProperty(parent, CFSTR(kIOMACAddress), kCFAllocatorDefault, 0);
+            if (mac && CFGetTypeID(mac) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)mac) >= 6) {
+                result.resize(6);
+                CFDataGetBytes((CFDataRef)mac, CFRangeMake(0, 6), result.data());
+            }
+            if (mac) CFRelease(mac);
+            IOObjectRelease(parent);
+        }
+        IOObjectRelease(interface);
+        if (!result.empty()) break;
+    }
+
+    IOObjectRelease(iterator);
+#endif
+    return result;
+}
+
 static std::vector<uint8_t> readFirstValidMacAddress() {
     std::vector<uint8_t> result;
 #ifdef _WIN32
@@ -369,6 +422,18 @@ static std::vector<uint8_t> readLinuxEtcInodeBytes() {
     return result;
 }
 
+static std::vector<uint8_t> readMacEtcStatOffsetBytes() {
+    std::vector<uint8_t> result;
+#ifdef __APPLE__
+    struct stat info;
+    if (stat("/etc", &info) == 0) {
+        const uint8_t* bytes = (const uint8_t*)&info;
+        result.assign(bytes + 4, bytes + 8);
+    }
+#endif
+    return result;
+}
+
 static std::vector<uint8_t> readVolumeSerialBytes() {
     std::vector<uint8_t> result;
 #ifdef _WIN32
@@ -400,6 +465,10 @@ static std::string generatePcidList() {
     std::string network_id = md5Hex(readLinuxEth0MacAddress());
     std::string system_id = md5Hex(readLinuxEtcInodeBytes());
     return "linux," + network_id + "," + system_id + ",";
+#elif defined(__APPLE__)
+    std::string network_id = md5Hex(readMacPrimaryMacAddress());
+    std::string system_id = md5Hex(readMacEtcStatOffsetBytes());
+    return "mac," + network_id + "," + system_id + ",";
 #else
     std::string machine_id = md5RevHex(readWindowsDigitalProductId());
     std::string network_id = md5RevHex(readFirstValidMacAddress());
